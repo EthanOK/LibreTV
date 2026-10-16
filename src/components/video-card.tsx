@@ -351,6 +351,22 @@ export function AggregatedCard({
           <div className="grid grid-cols-1 min-[348px]:grid-cols-2 gap-1.5">
             {group.items.map((item) => {
               const itemKey = qualityKey(item.sourceKey, item.vodId);
+              const remarks = formatRemarks(item.remarks);
+              const shownRemarks = (() => {
+                if (!remarks) return undefined;
+                const epMatch = /^(?:全|更新至)(\d+)集$/.exec(remarks);
+                if (epMatch) {
+                  // 单集（1集）= 电影/单集影片，没有「更新到第几集」这回事，不显示；
+                  // 多集电视剧/综艺才显示集数进度
+                  return parseInt(epMatch[1], 10) > 1 ? remarks : undefined;
+                }
+                // 带「全」「更新至」「更新」「更至」前缀但后面不是集数（如「更新HD」）：
+                // 前缀对单集影片没有意义，剥掉后保留实际内容（HD / 高清 这类）
+                const prefixMatch = /^(?:全|更(?:新至|新|至))\s*(.+)$/.exec(remarks);
+                if (prefixMatch) return prefixMatch[1].trim() || undefined;
+                // 非集数备注（电影的正片、HD国语 等）原样显示
+                return remarks;
+              })();
               return (
                 // 两列下一行放不下「源名 + 画质 + 集数 + 图标」，拆成两行：
                 // 上行源名与播放图标，下行画质与集数。信息一项不减，按钮高度 +14px 左右
@@ -381,17 +397,8 @@ export function AggregatedCard({
                   </span>
                   <span className="flex min-w-0 items-center gap-1.5">
                     <QualityBadge entry={qualities[itemKey]} loading={probing[itemKey]} />
-                    {/* 显示全组统一的结论；该源自己的标注若不同，悬停可见，信息不丢 */}
-                    <span
-                      className="text-faint truncate flex-1 min-w-0"
-                      title={
-                        item.remarks && formatRemarks(item.remarks) !== group.remarks
-                          ? `该源原始标注：${item.remarks}`
-                          : undefined
-                      }
-                    >
-                      {group.remarks || '暂无介绍'}
-                    </span>
+                    {/* 该源自己的备注：电视剧是它报的集数，电影是「HD国语」这类 */}
+                    {shownRemarks && <span className="text-faint truncate flex-1 min-w-0">{shownRemarks}</span>}
                   </span>
                 </button>
               );
