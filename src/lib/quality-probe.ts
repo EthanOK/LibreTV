@@ -45,7 +45,7 @@ export const QUALITY_PROBE_TIMEOUT_MS = 8000;
  */
 const SEGMENT_BUDGET_MS = 4000;
 
-/** 从 m3u8 文本解析最高档高度；非 master playlist（无 STREAM-INF）返回 undefined */
+/** 从 m3u8 文本解析最高档的短边高度；非 master playlist（无 STREAM-INF）返回 undefined */
 export function parseBestHeight(text: string): number | undefined {
   if (!text.includes('#EXT-X-STREAM-INF')) return undefined;
   let best: number | undefined;
@@ -55,9 +55,13 @@ export function parseBestHeight(text: string): number | undefined {
     if (line.startsWith('#EXT-X-STREAM-INF')) {
       const bandwidth = parseInt(line.match(/BANDWIDTH=(\d+)/)?.[1] || '0', 10);
       const resolution = line.match(/RESOLUTION=(\d+)x(\d+)/);
+      // 取短边而非第二个数字：档位本就按短边定义（720P = 1280×720 的 720），
+      // 采集站常把宽高写反（如把 1280×720 写成 720x1280），按 height 取会得到 1280 → 标成 2K
       pending = {
         bandwidth,
-        height: resolution ? parseInt(resolution[2], 10) : undefined,
+        height: resolution
+          ? Math.min(parseInt(resolution[1], 10), parseInt(resolution[2], 10))
+          : undefined,
       };
       continue;
     }

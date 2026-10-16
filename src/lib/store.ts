@@ -3,7 +3,7 @@
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 import type { QualityEntry, SourceConfig, LiveSourceConfig, SourceSearchOutcome } from './types';
-import { mergeQualityEntries, qualityKey } from './quality';
+import { isQualityEntryFresh, mergeQualityEntries, qualityKey } from './quality';
 import { clearLiveProbeResultsDb, loadLiveProbeResults, saveLiveProbeResults } from './db';
 import { PERSIST_KEY, createThrottledStorage } from './persist-storage';
 
@@ -884,7 +884,10 @@ export function isSourceDisabled(
  * 结果都触发所有卡片重渲染，因此只在展开面板 / 探测回调时用 getState 读。
  */
 export function readQuality(sourceKey: string, vodId: string): QualityEntry | undefined {
-  return useAppStore.getState().qualityMap[qualityKey(sourceKey, vodId)];
+  const entry = useAppStore.getState().qualityMap[qualityKey(sourceKey, vodId)];
+  // 过期条目按「没有结论」处理：持久化回来后 TTL 只在写入时清理过，
+  // 直接返回会让旧画质一直显示，且因为被认为已有结论而永远不重探
+  return entry && isQualityEntryFresh(entry) ? entry : undefined;
 }
 
 /** 批量读取：一次拿多个「源 + 影片」的画质，避免逐个 getState */
@@ -894,7 +897,7 @@ export function readQualities(pairs: Array<{ sourceKey: string; vodId: string }>
   for (const p of pairs) {
     const key = qualityKey(p.sourceKey, p.vodId);
     const entry = map[key];
-    if (entry) out[key] = entry;
+    if (entry && isQualityEntryFresh(entry)) out[key] = entry;
   }
   return out;
 }

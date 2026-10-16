@@ -18,6 +18,18 @@ export const QUALITY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
  */
 export const QUALITY_FAIL_TTL_MS = 10 * 60 * 1000;
 
+/**
+ * 条目是否仍在有效期内（唯一判定入口，写入与读取都走这里）。
+ *
+ * 读取路径也必须过滤：qualityMap 是持久化的，刷新页面后旧条目直接从 localStorage
+ * 回到内存；而写入路径（mergeQualityEntries）只有在下次写入时才顺带清理。
+ * 只清理不过滤的话，过期条目会被当成终态显示，且因为「已有结论就不再探」而永不过期。
+ */
+export function isQualityEntryFresh(entry: QualityEntry, now = Date.now()): boolean {
+  const ttl = entry.error ? QUALITY_FAIL_TTL_MS : QUALITY_TTL_MS;
+  return now - entry.timestamp < ttl;
+}
+
 /** 缓存键：按「源 + 影片」，同一源的不同剧画质不同，不能按源整体记录 */
 export function qualityKey(sourceKey: string, vodId: string): string {
   return `${sourceKey}:${vodId}`;
@@ -80,8 +92,7 @@ export function mergeQualityEntries(
   // 过期条目顺带清理。「测不出」（无 error）是有效结论，按长 TTL 保留，
   // 否则每次展开来源面板都会白探测一遍同一个源；失败按短 TTL 淘汰，给重试留机会
   for (const [key, entry] of Object.entries(current)) {
-    const ttl = entry.error ? QUALITY_FAIL_TTL_MS : QUALITY_TTL_MS;
-    if (now - entry.timestamp < ttl) next[key] = entry;
+    if (isQualityEntryFresh(entry, now)) next[key] = entry;
   }
 
   for (const [key, value] of Object.entries(incoming)) {

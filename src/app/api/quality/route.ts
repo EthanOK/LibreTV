@@ -83,22 +83,37 @@ export async function POST(req: Request) {
 
   const isStream = new URL(req.url).searchParams.get('stream') === '1';
 
+  // 同一「源地址 + detail + 影片」的探测按进程内合并：缓存只在探测完成后才写入，
+  // 并发的重复条目会同时 miss、各打一遍源站，缓存本身挡不住。
+  // 结果仍按条目各自的 sourceKey 返回——直接按 cacheKey 去重会吞掉另一个源的结论，
+  // 那个源在前端就永远拿不到结果、徽章不亮
+  const inflight = new Map<string, Promise<CachedProbe>>();
+
   const resolveItem = async (item: QualityProbeItem): Promise<QualityProbeResult> => {
     const key = cacheKey(item);
     const cached = getCache<CachedProbe>(key);
     if (cached) {
       return { sourceKey: item.source.key, vodId: item.id, height: cached.height, error: cached.error };
     }
-    try {
-      const result = await probeQuality(item, req.signal);
-      // 「测不出」（height 缺失且无 error）同样是有效结论，也要缓存，
-      // 否则单码率源每次展开都会被重复探测一遍
-      setCache(key, { height: result.height, error: result.error }, result.error ? FAIL_CACHE_TTL : OK_CACHE_TTL);
-      return result;
-    } catch {
-      // 客户端断开等中断：不缓存、也不作为失败结果下发
-      return { sourceKey: item.source.key, vodId: item.id, error: '探测已取消' };
+    let pending = inflight.get(key);
+    if (!pending) {
+      pending = (async () => {
+        try {
+          const result = await probeQuality(item, req.signal);
+          const value: CachedProbe = { height: result.height, error: result.error };
+          // 「测不出」（height 缺失且无 error）同样是有效结论，也要缓存，
+          // 否则单码率源每次展开都会被重复探测一遍
+          setCache(key, value, result.error ? FAIL_CACHE_TTL : OK_CACHE_TTL);
+          return value;
+        } catch {
+          // 客户端断开等中断：不缓存、也不作为失败结果下发
+          return { error: '探测已取消' };
+        }
+      })();
+      inflight.set(key, pending);
     }
+    const value = await pending;
+    return { sourceKey: item.source.key, vodId: item.id, height: value.height, error: value.error };
   };
 
   if (!isStream) {

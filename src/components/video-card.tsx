@@ -131,9 +131,14 @@ export function AggregatedCard({
   // （height 缺失代表「测不出」），所以「无条目」= 尚未探测。
   const [qualities, setQualities] = useState<Record<string, QualityEntry>>({});
   const [probing, setProbing] = useState<Record<string, true>>({});
-  // 已发起过探测的键 → 发起时间。折叠再展开不重复打源站；
-  // 但需要跳过「探测失败」的条目——失败是瞬时的，永久锁死会让偶发失败的源再也拿不到画质
-  const requestedRef = useRef<Map<string, number>>(new Map());
+  // 正在探测中的键：只用于防同一个键并发重复请求，拿到结果或被掐掉就移除
+  const inflightRef = useRef<Set<string>>(new Set());
+  // 拿到终态结果（有画质 / 测不出 / 失败）的键 → 时间。折叠再展开不重复打源站；
+  // 失败是瞬时的，永久锁死会让偶发失败的源再也拿不到画质，所以冷却满 QUALITY_FAIL_TTL_MS 才重试。
+  // 只记「拿到结果」的键：请求被掐掉时没有终态，记下来会让该源被锁到冷却结束
+  const settledRef = useRef<Map<string, number>>(new Map());
+  // 当前批次的键：被下一批掐掉时，靠它把未完成的键解锁
+  const batchRef = useRef<Set<string>>(new Set());
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => () => abortRef.current?.abort(), []);
@@ -148,20 +153,32 @@ export function AggregatedCard({
     setQualities((prev) => ({ ...cached, ...prev }));
 
     const now = Date.now();
-    const pending = group.items.filter((i) => {
-      const key = qualityKey(i.sourceKey, i.vodId);
-      const known = cached[key] ?? qualities[key];
-      // 已有结论就不再探：成功和「测不出」都是终态，重探也还是同一个结果
-      if (known && !known.error) return false;
-      const last = requestedRef.current.get(key);
-      if (last === undefined) return true;
-      // 探测失败过：冷却满 QUALITY_FAIL_TTL_MS 才重试，
-      // 否则每次展开都要重打一遍挂掉的源，白等一轮超时
-      return now - last > QUALITY_FAIL_TTL_MS;
-    });
-    if (pending.length === 0) return;
+    const selectPending = () =>
+      group.items.filter((i) => {
+        const key = qualityKey(i.sourceKey, i.vodId);
+        const known = cached[key] ?? qualities[key];
+        // 已有结论就不再探：成功和「测不出」都是终态，重探也还是同一个结果
+        if (known && !known.error) return false;
+        // 已在飞：等这一批的结果，不重复打
+        if (inflightRef.current.has(key)) return false;
+        const last = settledRef.current.get(key);
+        if (last === undefined) return true;
+        // 探测失败过：冷却满 QUALITY_FAIL_TTL_MS 才重试，
+        // 否则每次展开都要重打一遍挂掉的源，白等一轮超时
+        return now - last > QUALITY_FAIL_TTL_MS;
+      });
 
-    const items = pending
+    // 没有新要探的键：让上一批跑完，不打断它（结果回来照样更新徽章）
+    if (selectPending().length === 0) return;
+
+    // 掐掉上一批：本轮要重发，留着只会互相打断。
+    // 同时把它未拿到结果的键解锁——否则这些键既不在飞、又因 inflight 选不进本批，
+    // 徽章会一直空着，直到冷却结束才有机会重探
+    for (const k of batchRef.current) inflightRef.current.delete(k);
+    batchRef.current.clear();
+    abortRef.current?.abort();
+
+    const items = selectPending()
       .map((i) => {
         const key = qualityKey(i.sourceKey, i.vodId);
         const source =
@@ -173,21 +190,26 @@ export function AggregatedCard({
       .filter((v): v is { key: string; item: { source: SourceConfig; id: string } } => Boolean(v));
 
     if (items.length === 0) return;
-    for (const { key } of items) requestedRef.current.set(key, now);
+    const keys = items.map((i) => i.key);
+    // 探测结果先攒在这里，流结束时一次性写全局缓存：逐条写会让 persist
+    // 把整个状态（含最多 400 条画质记录）序列化十几遍
+    const collected: Record<string, QualityEntry> = {};
+    const batch = new Set(keys);
+    for (const k of keys) inflightRef.current.add(k);
+    batchRef.current = batch;
     setProbing((prev) => {
       const next = { ...prev };
-      for (const { key } of items) next[key] = true;
+      for (const k of keys) next[k] = true;
       return next;
     });
 
-    abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
 
-    const finish = (keys: string[]) => {
+    const finish = (targets: string[]) => {
       setProbing((prev) => {
         const next = { ...prev };
-        for (const k of keys) delete next[k];
+        for (const k of targets) delete next[k];
         return next;
       });
     };
@@ -203,17 +225,28 @@ export function AggregatedCard({
             error: result.error,
             timestamp: Date.now(),
           };
+          // 逐条更新本卡片的徽章（流式效果保留）
           setQualities((prev) => ({ ...prev, [key]: entry }));
-          // 写入全局缓存：同一部剧在别处（换源面板、再次搜索）也能直接复用
-          useAppStore.getState().setQuality({ [key]: entry });
+          collected[key] = entry;
+          // 拿到终态：解锁并发标记，并记下冷却起点
+          inflightRef.current.delete(key);
+          settledRef.current.set(key, Date.now());
           finish([key]);
         },
         controller.signal
       )
       .catch(() => {
-        // 探测整批失败（离线/未登录）：保持「未知」，不打断选源
+        // 探测整批失败（离线/未登录）或被新一轮掐掉：保持「未知」，不打断选源
       })
-      .finally(() => finish(items.map((i) => i.key)));
+      .finally(() => {
+        // 一次性写入全局缓存：同一部剧在别处（换源面板、再次搜索）也能复用。
+        // 中断时也会走到这里，已拿到的结果不会丢
+        if (Object.keys(collected).length > 0) useAppStore.getState().setQuality(collected);
+        // 本批未拿到终态的键一律解锁，下次展开可以立刻重试
+        for (const k of batch) inflightRef.current.delete(k);
+        if (batchRef.current === batch) batchRef.current.clear();
+        finish(keys);
+      });
   };
 
   const multi = group.items.length > 1;

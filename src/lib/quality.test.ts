@@ -3,6 +3,7 @@ import {
   QUALITY_FAIL_TTL_MS,
   QUALITY_TTL_MS,
   inferHeightFromBitrate,
+  isQualityEntryFresh,
   mergeQualityEntries,
   qualityLabel,
 } from './quality';
@@ -92,6 +93,24 @@ seg0.ts
 `;
     expect(parseBestHeight(text)).toBe(1080);
   });
+
+  it('取短边：源站把宽高写反（720x1280）时拿到 720 而非 1280', () => {
+    // 实际采集站常见 720P 源被标成 720x1280；之前按 height 取会得到 1280 → qualityLabel 成 2K
+    const text = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=720x1280
+720p/index.m3u8
+`;
+    expect(parseBestHeight(text)).toBe(720);
+  });
+
+  it('取短边：正常的 1280x720 不受影响', () => {
+    // 回归保护：取短边后档位判断与原本按 height 写在 16:9 视频上一致
+    const text = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=1280x720
+720p/index.m3u8
+`;
+    expect(parseBestHeight(text)).toBe(720);
+  });
 });
 
 describe('parseMediaPlaylist', () => {
@@ -140,6 +159,30 @@ seg0.ts
 
   it('m3u8 里没有分片时返回空，调用方据此判定测不出', () => {
     expect(parseMediaPlaylist('#EXTM3U\n#EXT-X-ENDLIST\n').firstSegment).toBeUndefined();
+  });
+});
+
+describe('isQualityEntryFresh', () => {
+  const T = 1_700_000_000_000;
+
+  it('成功与「测不出」按长 TTL 判定', () => {
+    const ok: QualityEntry = { height: 1080, from: 'probe', timestamp: T };
+    const unknown: QualityEntry = { from: 'probe', timestamp: T };
+    expect(isQualityEntryFresh(ok, T + QUALITY_TTL_MS - 1)).toBe(true);
+    expect(isQualityEntryFresh(unknown, T + QUALITY_TTL_MS - 1)).toBe(true);
+    expect(isQualityEntryFresh(ok, T + QUALITY_TTL_MS + 1)).toBe(false);
+  });
+
+  it('失败按短 TTL 判定：过期后允许重试', () => {
+    const failed: QualityEntry = { from: 'probe', error: 'HTTP 403', timestamp: T };
+    expect(isQualityEntryFresh(failed, T + QUALITY_FAIL_TTL_MS - 1)).toBe(true);
+    expect(isQualityEntryFresh(failed, T + QUALITY_FAIL_TTL_MS + 1)).toBe(false);
+  });
+
+  it('读取路径靠它挡住持久化回来的过期条目', () => {
+    // 刷新页面后旧条目直接从 localStorage 回到内存，写入时的清理没机会跑
+    const stale: QualityEntry = { height: 720, from: 'play', timestamp: T };
+    expect(isQualityEntryFresh(stale, T + QUALITY_TTL_MS * 2)).toBe(false);
   });
 });
 
